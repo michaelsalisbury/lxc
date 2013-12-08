@@ -1,0 +1,684 @@
+#!/bin/bash
+
+#
+# template script for generating CentOS container for LXC
+#
+
+# is this centos?
+[ -f /etc/redhat-release ] && is_centos=true
+
+main()
+{
+	parse_args "$@"
+	dependency_check
+	#
+	clean
+	# setup undo script
+	trap revert SIGHUP SIGINT SIGTERM
+	# setup lxc files config and fstab
+	copy_configuration
+	# download rpms, install minimal centos, copy rootfs cache
+	install_centos
+	# tweak; /etc/fstab           /selinux/enforce     /etc/rc.sysinit
+	#        /etc/ssh/sshd_config /etc/resolv.conf     
+	#        /etc/sysconfig/init  /etc/rc.d/rc.sysinit
+	configure_centos
+
+}
+
+revert()
+{
+	# undo if this script was stopped before finishing
+    echo "Interrupted, so cleaning up"
+	umount ${cache}/partial/RPMS
+	umount ${cache}/partial/RPMS
+    lxc-destroy -n $name
+    # maybe was interrupted before copy config
+    rm -rf $path/$name
+    rm -rf $default_path/$name
+    echo "exiting..."
+    exit 1
+}
+
+parse_args()
+{
+	# options line from lxc-ubuntu
+	# options=$(getopt -o a:b:hp:r:xn:FS:d -l arch:,bindhome:,help,path:,release:,trim,name:,flush-cache,auth-key:,debug,rootfs: -- "$@")
+	# added flush-cache and rootfs as a result.   
+	options=$(getopt -o hp:n:cR:m: -l help,path:,name:,flush-cache,clean,mac:,release:,releaseminor:,rootfs: -- "$@")
+	if [ $? -ne 0 ]; then
+		usage $(basename $0)
+		exit 1
+	fi
+
+	eval set -- "$options"
+
+	while true
+	do
+		case "$1" in
+			-h|--help)			usage $0 && exit 0;;
+			--rootfs)			rootfs=$2;			shift 2;;
+			-p|--path)			path=$2;			shift 2;;
+			-n|--name)			name=$2;			shift 2;;
+			-F|--flush-cache)	clean=1;			shift 1;;
+			-c|--clean)			clean=1;			shift 1;;
+			-R|--release)		release=$2;			shift 2;;
+			-m|--releaseminor)	releaseminor=$2;	shift 2;;
+			--mac)				mac=$2;				shift 2;;
+			--)					shift 1;			break ;;
+			*)										break ;;
+		esac
+	done
+
+	# exit if no container name provided
+	if [ -z "$name" ]; then
+		echo Please provide a container name...
+		echo
+		usage $(basename $0)
+		exit 1
+	fi
+
+	# defaults
+	[ "$arch" = "i686" ]	&& arch=i386
+	[ -z "$arch" ]			&& arch=x86_64
+	[ -z "$cache_base" ]	&& cache_base=/var/cache/lxc/centos/$arch
+	[ -z "$default_path" ]	&& default_path=/var/lib/lxc
+	[ -z "$root_password" ]	&& root_password=password
+	[ -z "$path" ]			&& path=$default_path/$name
+	[ -z "$release" ]		&& release=6
+	[ -z "$releaseminor" ]	&& releaseminor=4
+	[ -z "$dependencies" ]	&& dependencies="yum yumdownloader curl bc"
+	[ -z "$mac" ]			&& mac="00:16:3e"
+
+	# set mac
+	mac=$(get_random_mac $mac)
+
+	# operational variables
+	rootfs_path=$path/rootfs
+	config_path=$default_path/$name
+	cache=$cache_base/$release
+
+	echo ${FUNCNAME} :: Arguments parsed and variables set | ${DONE}
+}
+get_random_mac()
+{
+	local mac=$1
+	local IFS=:
+	local -a MAC=( $mac )
+	while (( ${#MAC[*]} < 6 )); do
+		MAC[${#MAC[*]}]=$(
+			echo obase=16\; $RANDOM / \( 2 ^ 7 \)	|\
+			bc										|\
+			xargs -i- echo 0-						|\
+			sed 's/.*\(..$\)/\1/'
+		)
+	done
+	echo "${MAC[*]}"
+}
+
+dependency_check()
+{
+	# run as root
+	[ "$(id -u)" != "0" ] && { echo "This script should be run as 'root'"; exit 1; }
+	#
+	local pkg needed_pkgs
+	for pkg in $dependencies; do
+		type $pkg >/dev/null 2>&1
+		[ $? -ne 0 ] && needed_pkgs="$pkg${needed_pkgs:+ }$needed_pkgs"
+	done
+
+	if [ -n "$needed_pkgs" ]; then
+		echo "Missing commands: $needed_pkgs"
+		echo "Please install these using \"sudo apt-get install $needed_pkgs\""
+		echo "yumdownloader is in package yum-utils"
+		exit 1
+	fi
+
+	echo ${FUNCNAME} :: Dependencies checked | ${DONE}
+}
+
+
+
+#Configurations
+#arch=$(arch)
+#release=6
+#cache_base=/var/cache/lxc/centos/$arch
+#default_path=/var/lib/lxc
+#root_password=password
+
+
+#if [ "$arch" = "i686" ]; then
+#    arch=i386
+#fi
+
+configure_centos()
+{
+	echo ${FUNCNAME} :: Configuring CentOS Continer ... | ${HEAD}
+
+    # disable selinux in centos
+    mkdir -p $rootfs_path/selinux
+    echo 0 > $rootfs_path/selinux/enforce
+
+	if true; then
+		local S='[[:space:]]*'
+		local P='^[^#]\?'
+		cat <<-SED | sed -i -f <(cat) $rootfs_path/etc/pam.d/login
+			/${P}session${S}required${S}pam_selinux.so${S}close/ s/^/#/
+			/${P}session${S}required${S}pam_selinux.so${S}open/  s/^/#/
+			/${P}session${S}required${S}pam_loginuid.so/         s/^/#/
+		SED
+		# fixing root login for sshd
+		cat <<-SED | sed -i -f <(cat) $rootfs_path/etc/pam.d/sshd
+			/${P}session${S}required${S}pam_selinux.so${S}close/              s/^/#/
+			/${P}session${S}required${S}pam_loginuid.so/                      s/^/#/
+			/${P}session${S}required${S}pam_selinux.so${S}open${S}env_params/ s/^/#/
+		SED
+	fi
+
+   # configure the network using the dhcp
+	if true; then
+	    cat <<-EOF > ${rootfs_path}/etc/sysconfig/network-scripts/ifcfg-eth0
+			DEVICE=eth0
+			BOOTPROTO=dhcp
+			ONBOOT=yes
+			TYPE=Ethernet
+			USERCTL=yes
+			PEERDNS=yes
+			IPV6INIT=no
+			DHCP_HOSTNAME="$(if [ -x /etc/hostname ] && [ ! -z `cat /etc/hostname` ] ; then cat /etc/hostname ; else hostname ; fi )"
+		EOF
+	fi
+
+    # set the dns
+	if false; then
+	    cat <<-EOF > ${rootfs_path}/etc/resolv.conf
+			# Google public DNS
+			nameserver 8.8.8.8
+			nameserver 8.8.4.4
+		EOF
+	fi
+
+    # set the hostname
+    cat <<-EOF > ${rootfs_path}/etc/sysconfig/network
+		NETWORKING=yes
+		HOSTNAME=${name}
+	EOF
+
+    # set minimal hosts
+    cat <<-EOF > ${rootfs_path}/etc/hosts
+		127.0.0.1  localhost $name
+		::1        localhost localhost.localdomain localhost6 localhost6.localdomain6
+	EOF
+
+	# Fix /etc/rc.sysinit & /etc/rc.d/rc.sysinit
+	    sed -i 's|.sbin.start_udev||' ${rootfs_path}/etc/rc.sysinit
+	    sed -i 's|.sbin.start_udev||' ${rootfs_path}/etc/rc.d/rc.sysinit
+
+		# don't mount devpts, for pete's sake
+		#sed -i 's/^.*dev.pts.*$/#\0/' ${rootfs_path}/etc/rc.sysinit
+		#sed -i 's/^.*dev.pts.*$/#\0/' ${rootfs_path}/etc/rc.d/rc.sysinit
+		#sed -i 's/^.*dev.pts.*$/#\0/' ${rootfs_path}/etc/rc.d/rc.sysinit
+		#sed -i 's/^.*dev.pts.*$/#\0/' ${rootfs_path}/etc/rc.d/rc.sysinit
+		#sed -i 's/^.*dev.pts.*$/#\0/' ${rootfs_path}/etc/rc.d/rc.sysinit
+		cat <<-EOF >> ${rootfs_path}/etc/rc.d/rc.sysinit
+			exit 0
+		EOF
+
+	# fix /etc/yum.repos.d/CentOS-Base.repo 
+		cat <<-SED | sed -i -f <(cat) ${rootfs_path}/etc/yum.repos.d/CentOS-Base.repo
+			s/^#baseurl/baseurl/g
+			s/\$releasever/$release.$releaseminor/g
+		SED
+
+    sed -i '115,126s/^/#/' ${rootfs_path}/etc/rc.d/init.d/halt
+
+
+	# configure services
+		chroot ${rootfs_path} chkconfig udev-post off
+		chroot ${rootfs_path} chkconfig network on
+		chroot ${rootfs_path} chkconfig sshd on
+		chroot ${rootfs_path} chkconfig ntpd on
+		chroot ${rootfs_path} chkconfig postfix off
+
+	# configure /dev
+	    dev_path="${rootfs_path}/dev"
+	    rm -rf $dev_path
+	    mkdir -p $dev_path
+	    mknod -m 666 ${dev_path}/null c 1 3
+	    mknod -m 666 ${dev_path}/zero c 1 5
+	    mknod -m 666 ${dev_path}/random c 1 8
+	    mknod -m 666 ${dev_path}/urandom c 1 9
+	    mkdir -m 755 ${dev_path}/pts
+	    mkdir -m 1777 ${dev_path}/shm
+	    mknod -m 666 ${dev_path}/tty c 5 0
+	    mknod -m 666 ${dev_path}/tty0  c 4 0
+	    mknod -m 666 ${dev_path}/tty1  c 4 1
+		mknod -m 666 ${dev_path}/tty2  c 4 2
+	    mknod -m 666 ${dev_path}/tty3  c 4 3
+	    mknod -m 666 ${dev_path}/tty4  c 4 4
+	    mknod -m 666 ${dev_path}/tty50 c 4 50
+	    mknod -m 600 ${dev_path}/console c 5 1
+	    mknod -m 666 ${dev_path}/full c 1 7
+	    mknod -m 600 ${dev_path}/initctl p
+	    #mknod -m 666 ${dev_path}/ptmx c 5 2
+		ln -s /dev/pts/ptmx ${dev_path}/ptmx
+
+    echo "setting root passwd to $root_password"
+    echo "root:$root_password" | chroot $rootfs_path chpasswd
+
+    # fstab
+	cat <<-EOF > ${rootfs_path}/etc/fstab
+		/dev/root	/			rootfs	defaults		0 0
+		none		/dev/shm	tmpfs	nosuid,nodev	0 0
+	EOF
+
+    # give us a console on /dev/console
+	cat <<-SED | sed -i -f <(cat) ${rootfs_path}/etc/sysconfig/init
+		/PROMPT/c\PROMPT=no
+		/ACTIVE_CONSOLES=/c\ACTIVE_CONSOLES="/dev/tty1"
+	SED
+		#/ACTIVE_CONSOLES=/c\ACTIVE_CONSOLES="/dev/console /dev/tty[1-4]"
+
+	# mod sshd_config
+	cat <<-SED | sed -i -f <(cat) ${rootfs_path}/etc/ssh/sshd_config
+		\|^#HostKey /etc/ssh/ssh_host_rsa_key| s/^#//
+		\|^#HostKey /etc/ssh/ssh_host_dsa_key| s/^#//
+		/^#PermitRootLogin yes/                s/^#//
+		/^GSSAPICleanupCredentials yes/        s/^/#/
+		/^#GSSAPIAuthentication no/            s/^#//
+		/^#UseDNS yes/                         c\UseDNS no
+	SED
+
+	echo ${FUNCNAME} :: CentOS Continer Configured ... | ${HEAD}
+    return 0
+}
+
+download_centos()
+{
+	echo ${FUNCNAME} :: Starting centos download ... | ${HEAD}
+
+	local YUM PKG_LIST
+	MIRRORLIST_URL="http://mirrorlist.centos.org/?release=$release&arch=$arch&repo=os"
+	INSTALL_ROOT=$cache/partial
+
+	# minimal centos install package list
+	read -d $'' PKG_LIST <<-ENDLIST
+		yum initscripts passwd rsyslog vim-minimal dhclient chkconfig
+		rootfiles policycoreutils centos-release openssh-server avahi
+		openssh-clients sudo plymouth vim
+	ENDLIST
+
+	# clean if partial install was started but not finished
+	mkdir -p $cache
+	if [ -d $INSTALL_ROOT ]; then
+		echo ${FUNCNAME} :: Cleaning staging dir from incompleate install | ${MESG}
+		rm   -rf $INSTALL_ROOT
+	fi
+	mkdir -p $INSTALL_ROOT
+
+	# download centos-release-6-4.el6.centos.x86_64.rpm
+		DOWNLOAD_OK=no
+		for trynumber in 1 2 3; do
+			[ $trynumber != 1 ] && echo "Trying again..."
+			MIRROR_URL=$(curl -s -S -f "$MIRRORLIST_URL" | head -n2 | tail -n1)
+			if [ $? -ne 0 ] || [ -z "$MIRROR_URL" ]; then
+				echo ${FUNCNAME} :: "Failed to get a mirror" | ${ERRR}
+				continue
+			fi
+			RELEASE_URL="$MIRROR_URL/Packages/centos-release-$release-$releaseminor.el6.centos.10.$arch.rpm"
+			echo "Fetching from $RELEASE_URL"
+			curl -f "$RELEASE_URL" > $INSTALL_ROOT/centos-release-$release-$releaseminor.centos.$arch.rpm
+			if [ $? -ne 0 ]; then
+				echo ${FUNCNAME} :: "Failed to download centos release rpm" | ${ERRR}
+				continue
+			fi
+			DOWNLOAD_OK=yes
+			break
+		done
+		if [ $DOWNLOAD_OK != yes ]; then
+			echo ${FUNCNAME} :: "Aborting; failed to download centos release rpm" | ${ERRR}
+			exit 1
+		fi
+
+	# prep minimal install
+		# get release rpm
+		mkdir -p $INSTALL_ROOT/var/lib/rpm
+		rpm --root $INSTALL_ROOT --initdb
+		rpm --root $INSTALL_ROOT \
+			-ivh $INSTALL_ROOT/centos-release-$release-$releaseminor.centos.$arch.rpm
+
+	# Enable yum within chroot
+		# set /etc/resolv.conf to enable yum to work
+		cat <<-RESOLVE > ${INSTALL_ROOT}/etc/resolv.conf
+			# Google public DNS
+			nameserver 8.8.8.8
+			nameserver 8.8.4.4
+		RESOLVE
+
+		# set the following dev items to enable yum to work
+		mkdir -p ${INSTALL_ROOT}/dev
+		#mknod -m 666 ${dev_path}/null c 1 3
+		#mknod -m 666 ${dev_path}/zero c 1 5
+		mknod -m 666 ${INSTALL_ROOT}/dev/random c 1 8
+		mknod -m 666 ${INSTALL_ROOT}/dev/urandom c 1 9
+
+		# modify /etc/yum.repos.d/CentOS-Base.repo to enable yum to work
+		cp ${INSTALL_ROOT}/etc/yum.repos.d/CentOS-Base.repo ${INSTALL_ROOT}/etc/yum.repos.d/CentOS-Base.repo.bk
+		cat <<-SED | sed -i -f <(cat) ${INSTALL_ROOT}/etc/yum.repos.d/CentOS-Base.repo
+			s/^#baseurl/baseurl/g
+			s/\$releasever/$release.$releaseminor/g
+		SED
+
+	# seed minimal centos install
+	yum_install ${INSTALL_ROOT} ${cache_base}/../RPMS yum
+	sleep 1
+	yum_install ${INSTALL_ROOT} ${cache_base}/../RPMS ${PKG_LIST}
+
+	# clean-up
+		chroot ${INSTALL_ROOT} rm -f /var/lib/rpm/__*
+		chroot ${INSTALL_ROOT} rpm --rebuilddb
+		if [ $? -ne 0 ]; then
+			echo ${FUNCNAME} :: "Failed to download the rootfs, aborting." | ${MESG}
+			exit 1
+		fi
+
+	# over-write old cache rootfs
+	umount ${INSTALL_ROOT}/RPMS
+	mv "${INSTALL_ROOT}" "$cache/rootfs"
+	echo ${FUNCNAME} :: "Download\/Install complete." | ${DONE}
+
+	# done
+	return 0
+}
+
+yum_install()
+{
+	local INSTALL_ROOT=$1
+	shift
+	local RPM_CACHE_DIR=$1
+	shift
+	local PKG_LIST=$@
+
+	echo ${FUNCNAME} :: Downloading, Installing + Registering RPMS ... | ${HEAD}
+
+	# bind mount RPMS
+		mkdir -p                       ${INSTALL_ROOT}/RPMS
+		mount -o bind ${RPM_CACHE_DIR} ${INSTALL_ROOT}/RPMS
+
+	# generate list of RPMS and pipe them into the code block below
+	echo ${FUNCNAME} :: Generate list of RPMS to install | ${MESG}
+	yumdownloader						\
+		--installroot $INSTALL_ROOT		\
+		--assumeyes						\
+		--nogpgcheck					\
+		--color always					\
+		--destdir $RPM_CACHE_DIR		\
+		--resolve						\
+		--url							\
+		--quiet							\
+		${PKG_LIST}						|\
+		{
+			while read RPM; do
+				NAME=$(basename $RPM)
+				# concatinate all the RPMS generated and piped from the yumdownloader cmd
+				PKGS=${PKGS}${PKGS:+ }${RPM_CACHE_DIR}/${NAME}
+				PKGN=${PKGN}${PKGN:+ }/RPMS/${NAME}
+				# download missing RPMS
+				if [ ! -f ${RPM_CACHE_DIR}/${NAME} ]; then
+					(	echo ${FUNCNAME} :: Downloading ${NAME}
+						sleep 0.3
+						wget -nc -q -t 3 -O ${RPM_CACHE_DIR}/${NAME} ${RPM}
+						if [ $? -ne 0 ]; then
+							echo ${FUNCNAME} :: Download FAILED .. ${RPM} | ${ERRR}
+							exit 1
+						fi
+						echo ${FUNCNAME} :: DONE ${NAME}
+					) &
+				fi
+			done
+			sleep 1
+			echo ${FUNCNAME} :: Waiting for downloads to finish ... | ${MESG}
+			wait
+			echo ${FUNCNAME} :: Downloads finished ... | ${MESG}
+			sleep 1
+
+			# install just the RPMS that were requested not everything in the cache
+			echo ${FUNCNAME} :: Installing ... | ${MESG}
+			yum									\
+				--installroot $INSTALL_ROOT		\
+				--assumeyes						\
+				--nogpgcheck					\
+				--color always					\
+				install ${PKGS}
+			sleep 1
+			# register RPMS so that yum doesn't try to re-intall deps when a new package is needed
+			echo ${FUNCNAME} :: Registering ... | ${MESG}
+			for PKG in ${PKGN}; do
+				chroot $INSTALL_ROOT rpm -ivh --nodeps --nodigest --justdb ${PKG}
+			done
+		}
+
+		# umount RPMS dir
+		umount ${INSTALL_ROOT}/RPMS
+		umount ${INSTALL_ROOT}/RPMS
+
+		echo ${FUNCNAME} :: DONE setting up requested RPMS | ${DONE}
+}
+
+
+copy_centos()
+{
+    # make a local copy of the minicentos
+    echo ${FUNCNAME} :: "Rsync --delete-before rootfs to $rootfs_path ..." | ${HEAD}
+    mkdir -p $rootfs_path
+    rsync -a --delete-before $cache/rootfs/ $rootfs_path/
+	if [ $? -ne 0 ]; then
+		echo ${FUNCNAME} :: "Failed to copy rootfs" | ${ERRR}
+		exit 1
+	else
+		echo ${FUNCNAME} :: CentOS copied from cache to $rootfs_path\/ | ${DONE}
+	fi
+}
+
+update_centos()
+{
+	#echo "Updates disabled"
+	#return 0
+	echo ${FUNCNAME} :: Updating $cache/rootfs ... | ${HEAD}
+	chroot $cache/rootfs yum --assumeyes check-update
+	sleep 3
+	chroot $cache/rootfs yum --assumeyes update
+	if [ $? -ne 0 ]; then
+		echo ${FUNCNAME} :: "Failed to update 'centos base', continuing ..." | ${ERRR}
+	else
+		echo ${FUNCNAME} :: "Update finished" | ${DONE}
+	fi
+}
+
+update_centos_container()
+{
+  PKG_LIST="yum initscripts passwd rsyslog vim-minimal dhclient chkconfig"
+  PKG_LIST="$PKG_LIST rootfiles policycoreutils centos-release openssh-server avahi"
+  PKG_LIST="$PKG_LIST openssh-clients sudo plymouth vim"
+
+  chroot $rootfs_path yum -y --nogpgcheck install $PKG_LIST
+  sleep 4
+  chroot $rootfs_path yum -y --nogpgcheck install $PKG_LIST
+  return $?
+}
+
+install_centos()
+{
+    mkdir -p /var/lock/subsys/
+	{
+		flock -x 200
+		if [ $? -ne 0 ]; then
+			echo ${FUNCNAME} :: "Cache repository is busy." | ${MESG}
+			return 1
+		fi
+
+		echo ${FUNCNAME} :: "Checking cache download in $cache/rootfs ... " | ${MESG}
+		if [ ! -e "$cache/rootfs" ]; then
+			download_centos
+			if [ $? -ne 0 ]; then
+				echo ${FUNCNAME} :: "Failed to download 'centos base'" | ${MESG}
+				return 1
+			fi
+		else
+			#echo ${FUNCNAME} :: "Cache found. Updating..." | ${MESG}
+			update_centos
+		fi
+
+		echo ${FUNCNAME} :: "Copy $cache/rootfs to $rootfs_path ... " | ${MESG}
+		copy_centos
+
+	} 200>/var/lock/subsys/lxc
+
+	echo ${FUNCNAME} :: download/install compleate | ${DONE}
+}
+
+copy_configuration()
+{
+	mkdir -p $config_path
+
+	cat <<-EOF > $config_path/config
+		# Template
+		#
+		lxc.network.type = veth
+		lxc.network.hwaddr = $mac
+		lxc.network.flags = up
+		lxc.network.link = lxcbr0
+		lxc.rootfs = $rootfs_path
+		lxc.mount = $config_path/fstab
+		lxc.pivotdir = lxc_putold
+
+		lxc.devttydir = lxc
+		lxc.tty = 4
+		lxc.pts = 1024
+
+		lxc.utsname = $name
+		lxc.arch = amd64
+		lxc.cap.drop = sys_module mac_admin mac_override sys_time
+
+		# uncomment the next line to run the container unconfined:
+		lxc.aa_profile = unconfined
+
+
+		#lxc.aa_profile = unconfined
+		lxc.cgroup.devices.deny = a
+		# Allow any mknod (but not using the node)              
+		lxc.cgroup.devices.allow = c *:* m
+		lxc.cgroup.devices.allow = b *:* m
+		# /dev/null and zero
+		lxc.cgroup.devices.allow = c 1:3 rwm
+		lxc.cgroup.devices.allow = c 1:5 rwm
+		# consoles
+		lxc.cgroup.devices.allow = c 5:1 rwm
+		lxc.cgroup.devices.allow = c 5:0 rwm
+		#lxc.cgroup.devices.allow = c 4:0 rwm
+		#lxc.cgroup.devices.allow = c 4:1 rwm
+		#lxc.cgroup.devices.allow = c 4:2 rwm
+		#lxc.cgroup.devices.allow = c 4:3 rwm
+		#lxc.cgroup.devices.allow = c 4:4 rwm
+		#lxc.cgroup.devices.allow = c 4:5 rwm
+		# /dev/{,u}random
+		lxc.cgroup.devices.allow = c 1:9 rwm
+		lxc.cgroup.devices.allow = c 1:8 rwm
+		lxc.cgroup.devices.allow = c 136:* rwm
+		lxc.cgroup.devices.allow = c 5:2 rwm
+		# rtc
+		lxc.cgroup.devices.allow = c 254:0 rwm
+		# fuse
+		lxc.cgroup.devices.allow = c 10:229 rwm
+		# tun
+		lxc.cgroup.devices.allow = c 10:200 rwm
+		# full
+		lxc.cgroup.devices.allow = c 1:7 rwm
+		# hpet
+		lxc.cgroup.devices.allow = c 10:228 rwm
+		# kvm
+		#lxc.cgroup.devices.allow = c 10:232 rwm
+
+		# lxc.mount.entry :: custom mount entries
+		# lxc.mount.entry is prefered, because it supports relative paths
+		#lxc.mount.entry = proc proc proc nosuid,nodev,noexec  0 0
+		#lxc.mount.entry = sysfs sys sysfs nosuid,nodev,noexec,ro 0 0
+		lxc.mount.entry = devpts dev/pts devpts nosuid,noexec,mode=0620,ptmxmode=000,newinstance 0 0
+		#lxc.mount.entry = tmpfs dev/shm tmpfs nosuid,nodev,mode=1777 0 0
+		#lxc.mount.entry = tmpfs run tmpfs nosuid,nodev,noexec,mode=0755,size=128m 0 0
+		#lxc.mount.entry = tmpfs tmp tmpfs nosuid,nodev,noexec,mode=1777,size=1g 0 0
+
+		# experimental
+		#lxc.cgroup.cpuset.cpus = 0
+		#lxc.cgroup.cpu.shares = 1024
+		#lxc.cgroup.memory.limit_in_bytes = 512M
+		#lxc.cgroup.memory.memsw.limit_in_bytes = 512M
+	EOF
+
+	cat <<-EOF > $config_path/fstab
+		proc	proc	proc	nodev,noexec,nosuid	0 0
+		sysfs   sys		sysfs	defaults			0 0
+	EOF
+
+	if [ $? -ne 0 ]; then
+		echo "${FUNCNAME} :: Failed to add configuration"
+		exit 1
+	fi
+
+    return 0
+}
+
+clean()
+{
+	[ ! -e $cache ]		&& return 0
+	#echo ${FUNCNAME} :: cache does exist ... $cache
+	[ -z "${clean}" ]	&& return 0
+	#echo ${FUNCNAME} :: clean set, proceeding ...
+
+    # lock, so we won't purge while someone is creating a repository
+	(
+		flock -x 200
+		if [ $? != 0 ]; then
+			echo ${FUNCNAME} :: "Cache repository is busy." | ${MESG}
+			exit 1
+		fi
+
+		echo ${FUNCNAME} :: "Purging the download cache for Centos-$release-$releaseminor..." | ${MESG}
+		#rm --preserve-root --one-file-system -rf $cache && echo "Done." || exit 1
+		rm -rf $cache
+		echo ${FUNCNAME} :: "Download cache for Centos-$release-$releaseminor... Purged" | ${MESG}
+
+	) 200>/var/lock/subsys/lxc
+}
+
+usage()
+{
+    cat <<-EOF
+		usage:
+		    $1 -n|--name=<container_name>
+	        [-p|--path=<path>] [-c|--clean] [-R|--release=<Centos_release>]
+	        [-h|--help]                     [-A|--arch=<arch of the container>]
+		Mandatory args:
+		  -n,--name         container name, used to as an identifier for that container from now on
+		Optional args:
+		  -p,--path         Path to where the container rootfs will be created, defaults to /var/lib/lxc/[name].
+		                      The container config will go under /var/lib/lxc/[name] in that case
+		  -c,--clean        Clean the cache
+		  -R,--release      Centos release for the new container. if the host is Fedora,
+		                      then it will defaultto the host's release.
+		  -m,--release-minor Minor release number for the new containar
+		  -A,--arch         NOT USED YET. Define what arch the container will be [i686,x86_64]
+		  -h,--help         print this help
+	EOF
+    return 0
+}
+
+HEAD=sed\ "h;s/./>/g;p;x;p;s/./=/g;p;s/.//g"
+MESG=sed\ 'h;s/./_/g;G'
+ERRR=sed\ 'h;s/./!/g;p;x;G'
+DONE=sed\ 'h;s/./_/g;p;x;p;s/./</g'
+
+
+main "$@" 2>&1 | tee /var/log/lxc/$(basename $0).log
+exit 0
+

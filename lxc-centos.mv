@@ -1,0 +1,52 @@
+#!/bin/bash
+
+(( ${#1} )) || exit
+[ -d "/var/lib/lxc/$1" ] || exit
+(( ${#2} )) || exit
+ OLD_NAME=$1
+     NAME=$2
+OLD_CNTNR="/var/lib/lxc/${OLD_NAME}"
+CONTAINER="/var/lib/lxc/${NAME}"
+
+# stop container if running
+while read LXC_PID; do
+	ps --no-heading -o cmd -p ${LXC_PID}	|\
+	grep -q ${OLD_CNTNR}			&&\
+	break
+	unset LXC_PID
+done < <(ps --no-heading -o pid -C lxc-start)
+
+
+if ps -o comm -p ${LXC_PID:-1} | grep -q ^lxc-start$; then
+	echo \ LXC_PID :: ${LXC_PID}
+	echo
+	ps --no-heading -o cmd -p ${LXC_PID}
+	echo
+	pstree -Ap ${LXC_PID}
+	echo
+	pstree -Ap ${LXC_PID}	|\
+	tr -s -c [:digit:] ' '	|\
+	xargs kill -9
+else
+	echo \ No running LXC container with that name at ${OLD_CNTNR}
+fi
+
+# mv container
+mv ${OLD_CNTNR} ${CONTAINER}
+
+# fix config
+cat <<-SED | sed -i -f <(cat) ${CONTAINER}/config
+	/^lxc.utsname =/ c\lxc.utsname = ${NAME}
+	/^lxc.rootfs =/  c\lxc.rootfs = ${CONTAINER}\/rootfs
+	/^lxc.mount =/   c\lxc.mount = ${CONTAINER}\/fstab
+SED
+
+# fix hosts
+sed -i "/^127.0.0.1/c\127.0.0.1 localhost ${NAME}" ${CONTAINER}/rootfs/etc/hosts
+
+# fix network
+sed -i "/^HOSTNAME=/c\HOSTNAME=${NAME}" ${CONTAINER}/rootfs/etc/sysconfig/network
+
+# ls
+ls -l ${CONTAINER}/..
+

@@ -1,0 +1,196 @@
+#!/bin/bash
+
+main()
+{
+	parse_args "$@"
+	verify_container || exit 1
+	container_halt
+	reboot_pause
+	container_start
+	container_status
+}
+
+parse_args()
+{
+	options=$(getopt -o sShHn:r -l help,start,status,halt,name:,reboot -- "$@")
+	if [ $? -ne 0 ]; then
+		usage $(basename $0)
+		exit 1
+	fi
+
+	eval set -- "$options"
+
+	while true
+	do
+		case "$1" in
+			-h|--help)			usage $0 && exit 0;;
+			-n|--name)			name=$2;			shift 2;;
+			-s|--start)			Start=1;			shift 1;;
+			-S|--status)		Status=1;			shift 1;;
+			-H|--halt)			halt=1;				shift 1;;
+			-r|--reboot)		halt=1; Start=1;	shift 1;;
+			--)					shift 1;			break ;;
+			*)										break ;;
+		esac
+	done
+
+	# defaults and global variables
+	[ -z "${containers}" ]	&& containers="/var/lib/lxc"
+	[ -z "${rootfs}" ]		&&     rootfs="${containers}/${name}/rootfs"
+
+        container="${containers}/${name}"
+	       config="${containers}/${name}/config"
+	lxc_start_pid="${containers}/${name}/LXC_PID"
+	container_pid="${containers}/${name}/PID"
+	      console="${containers}/${name}/CONSOLE"
+	  console_log="${containers}/${name}/CONSOLE.LOG"
+
+}
+reboot_pause()
+{
+	if [ -n "$halt" ] && [ -n "$Start" ] && (( halt = 1 )) && (( Start = 1 )); then
+		echo -n Rebooting container \"${name}\" .
+		local WAIT=9 # 1/3 seconds
+		while (( WAIT-- )); do echo -n .; sleep .33; done
+		echo
+	fi
+}
+verify_container()
+{
+	# exit if no container name provided
+	if [ -z "$name" ]; then
+		echo Please provide a container name ...
+		echo
+		usage $(basename $0)
+		exit 1
+	elif [ ! -d "${container}" ]; then
+		echo Container not found at ${container} ...
+		exit 1
+	elif [ ! -f "${config}" ]; then
+		echo Container config not found at ${config} ...
+		exit 1
+	elif [ ! -d "${rootfs}" ]; then
+		echo Container rootfs not found at ${rootfs} ...
+		exit 1
+	else
+		return 0
+	fi
+}
+usage()
+{
+	echo Hello World\!
+}
+container_status()
+{
+	if verify_container_pid; then
+		lxc-ls --fancy | sed -n "1p;2h;2p;/${name}\s/p;\$x;\$p"
+		ps --no-heading -o cmd -p ${cpid}
+		echo
+		pstree -Ap ${cpid}
+		echo
+	else
+		echo Container \"${name}\" is not running or PID could not be verified.
+		exit 1
+	fi
+}
+container_halt()
+{
+	if [ -n "$halt" ] && (( halt = 1 )) && verify_container_pid; then
+		# halting container via halt command
+		echo -n Halting container \"${name}\" .
+		lxc-attach -n ${name} -- halt
+		local WAIT=60 # half seconds
+		while (( WAIT-- )); do
+			if verify_container_pid; then
+				echo -n .
+				sleep .5
+			else
+				break
+			fi
+		done
+		# failsafe kill, signal 9, to all processes in tree
+		if verify_container_pid; then
+			pstree -Ap ${cpid}		|\
+			tr -s -c [:digit:] ' '	|\
+			xargs kill -9
+			echo \ Killed
+		else
+			echo \ Success
+		fi
+		# clean logs and pid files
+		rm -f ${lxc_start_pid}
+		cat <<-LOGROTATE > /dev/shm/$$${FUNCNAME}-LOGROTATE
+			rotate 5
+			${console} {}
+			${console_log} {}
+		LOGROTATE
+		logrotate -f /dev/shm/$$${FUNCNAME}-LOGROTATE
+		rm        -f /dev/shm/$$${FUNCNAME}-LOGROTATE
+	fi
+}
+verify_container_pid()
+{
+	# get container pid
+	if [ -f "${lxc_start_pid}" ] && [ -z "${cpid}" ]; then
+		cpid=$(cat "${lxc_start_pid}")
+	fi
+	# verify pid	
+	if ps -o comm -p ${cpid:-1} | grep -q ^lxc-start$ &&\
+	   ps -o cmd  -p ${cpid:-1} | grep -q "${container}"; then
+		return 0
+	fi
+	# find container pid
+	declare cpid
+	while read cpid; do
+		#ps -o cmd -p ${cpid} | grep -q "${container}" && break
+		cat <<-GREP | grep -q -f <(cat) <(ps -o cmd -p ${cpid}) && break
+			\\s-f\\s\\?${config}\\s
+			\\s--rcfile\\s\\?${config}\\s
+			\\s-n\\s\\?${name}\\s
+			\\s--name\\s\\?${name}\\s
+		GREP
+		unset cpid
+	done < <(ps --no-heading -o pid -C lxc-start)
+	# verify that a pid was found
+	if [ -n "${cpid}" ]; then
+		echo "${cpid}" > "${lxc_start_pid}"
+		return 0
+	else
+		echo > "${container_pid}"
+		return 1
+	fi
+}
+
+container_start()
+{
+	if [ -n "$Start" ] && (( Start = 1 )) && ! verify_container_pid; then
+		# start container as daemon
+		lxc-start -n ${name}		\
+			-f ${config}			\
+			-L ${console_log}		\
+			-c ${console}			\
+			-p ${container_pid}		\
+			-d
+
+	
+		# tail the console log
+		tail -n +1 -f ${console_log} &
+		local console_log_pid=$!
+		sleep 1
+
+		if verify_container_pid; then
+			# start a background thread to kill the console tail
+			{
+				while verify_container_pid; do sleep 2; done
+				ps -o comm -p ${console_log_pid:-1} | grep -q ^tail$ && kill -9 ${console_log_pid}
+			} &>/dev/null &
+			sleep 7
+		else
+			echo Container \"${name}\" did not start.
+			exit 1
+		fi
+	fi
+}
+main "$@"
+exit 0
+
