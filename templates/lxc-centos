@@ -231,14 +231,7 @@ configure_centos()
 	# Fix /etc/rc.sysinit & /etc/rc.d/rc.sysinit
 	    sed -i 's|.sbin.start_udev||' ${rootfs_path}/etc/rc.sysinit
 	    sed -i 's|.sbin.start_udev||' ${rootfs_path}/etc/rc.d/rc.sysinit
-
-		# don't mount devpts, for pete's sake
-		#sed -i 's/^.*dev.pts.*$/#\0/' ${rootfs_path}/etc/rc.sysinit
-		#sed -i 's/^.*dev.pts.*$/#\0/' ${rootfs_path}/etc/rc.d/rc.sysinit
-		#sed -i 's/^.*dev.pts.*$/#\0/' ${rootfs_path}/etc/rc.d/rc.sysinit
-		#sed -i 's/^.*dev.pts.*$/#\0/' ${rootfs_path}/etc/rc.d/rc.sysinit
-		#sed -i 's/^.*dev.pts.*$/#\0/' ${rootfs_path}/etc/rc.d/rc.sysinit
-		cat <<-EOF >> ${rootfs_path}/etc/rc.d/rc.sysinit
+		cat <<-EOF >>                 ${rootfs_path}/etc/rc.d/rc.sysinit
 			exit 0
 		EOF
 
@@ -254,7 +247,7 @@ configure_centos()
 		chroot ${rootfs_path} chkconfig udev-post off
 		chroot ${rootfs_path} chkconfig network on
 		chroot ${rootfs_path} chkconfig sshd on
-		chroot ${rootfs_path} chkconfig ntpd on
+		#chroot ${rootfs_path} chkconfig ntpd on
 		chroot ${rootfs_path} chkconfig postfix off
 		chroot ${rootfs_path} chkconfig iscsi off
 		chroot ${rootfs_path} chkconfig iscsid off

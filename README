@@ -1,0 +1,35 @@
+Please don't hesitate to e-mail me directly with comments, fixes or sugjestions.  michaelsalisbury@gmail.com
+
+
+
+This GIT repository is singularly focused on maintaining a lxc template script that installs a minimal CentOS guest version 5 and/or 6 on a Ubutu host versions12.10 or newer.  In addition to the lxc-centos script there are some other utilitarian scripts who use will be probably only be documented by the -h|--help argument.
+
+The following is a list of tested features that are considered working on the lxc-centos template script;
+ - Works for CentOS guests versions 5.10, 6.4, 6.5.
+ - Works for Ubuntu hosts version 12.10, 13.04, 13.10.
+ - Caches all RPMS to /var/cache/lxc/centos/RPMS.
+ - A cache clean wipes the cached rootfs of the CentOS version specified not the RPMS.
+ - RPMS cache clean command argument has been coded.
+ - Cached rootfs yum update works.
+ - The template generated a log that is overwritten for each execution; /var/log/lxc/lxc-centos.log
+
+The following is a list of significant changes that are made to the CentOS guest.
+Please evaluate the function configure_centos() for details and omissions (from this list).
+ - selinux is disabled
+ - A custom /etc/sysconfig/network-scripts/ifcfg-eth0 is generated and DHCP enabled.
+ - A custom /etc/sysconfig/network is generated.
+ - CentOS-Base.repo is fixed to match release major.minor
+ - Services network, sshd enabled.
+ - Services udev-post, postfix, iscsi, iscsid, lvm2-monitor, avahi-daemin disabled.
+ - Custom fstab generated.
+ - /etc/sysconfig/init modified (console entries).
+ - /etc/rc.d/rc.sysinit (udev entries +).
+ - /etc/ssh/sshd_config (GSSAPIAuthentication disabled, UseDNS disabled, Root Login enabled +).
+
+The following is a list of items I haven't tested, plan to add or are know to be broken.
+ - lxc-console works but login fails.  The same password works for ssh login, weird!
+ - CentOS 5.10 has a 
+ - rootfs dirs other than /var/lib/lxc/[guest name] not tested but not hard coded.
+ - I'm pretty sure that guest names with spaces in them won't be handled properly.
+ - Make additional yum repo packages a command line option.   Packages will be cached in the RPM cache.  Packages can be added when cached rootfs is cloned in addition to a clean install.
+ - Generate guest lxc config that can bridge the host directly and use the host DHCP server/network.  Currently the guest sits on a virtual network defined by /etc/default/lxc-net.  All access must be configured via proxys, PATs or port forwards.
