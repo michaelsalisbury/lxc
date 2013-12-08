@@ -1,0 +1,4 @@
+lxc
+===
+
+lxc templates; centos
